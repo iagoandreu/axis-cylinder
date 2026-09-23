@@ -1,0 +1,13 @@
+{
+    "autodeskProduct": "Fusion",
+    "type": "addin",
+    "id": "3f7a91c6-5d04-4b62-9a18-7c2e0b5d44a1",
+    "author": "Iago Andreu",
+    "description": {
+        "": "Create a solid cylinder from an origin and an axis, with the axis optionally taken as the normal of a plane fitted to a surface."
+    },
+    "version": "1.0.0",
+    "runOnStartup": true,
+    "supportedOS": "windows|mac",
+    "editEnabled": true
+}
