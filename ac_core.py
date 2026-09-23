@@ -278,19 +278,13 @@ def cylinder_ends(origin, direction, length_cm, symmetric, flip):
     return origin, ac_fit.add(origin, ac_fit.scale(d, length_cm))
 
 
-def build_cylinder(comp, p0, p1, radius_cm, name):
-    """A solid cylinder body. Works in a parametric and a direct design alike.
+def _add_body(comp, tmp, name):
+    """Put a temporary BRepBody into the document. Parametric or direct alike.
 
-    In a parametric design a body built from geometry rather than from features has
-    to go inside a BaseFeature, or bRepBodies.add refuses it.
+    In a parametric design a body built from geometry rather than from features
+    has to go inside a BaseFeature, or bRepBodies.add refuses it.
     """
-    tmp = adsk.fusion.TemporaryBRepManager.get().createCylinderOrCone(
-        _pt(p0), radius_cm, _pt(p1), radius_cm)
-    if tmp is None:
-        raise ac_fit.FitError('Fusion would not build a cylinder from those ends '
-                              '- check the length and diameter are not zero')
-    des = adsk.fusion.Design.cast(comp.parentDesign)
-    parametric = (des.designType
+    parametric = (comp.parentDesign.designType
                   == adsk.fusion.DesignTypes.ParametricDesignType)
     if parametric:
         base = comp.features.baseFeatures.add()
@@ -306,6 +300,16 @@ def build_cylinder(comp, p0, p1, radius_cm, name):
     except Exception:
         pass
     return body
+
+
+def build_cylinder(comp, p0, p1, radius_cm, name):
+    """A solid cylinder body, from the two end points and the radius."""
+    tmp = adsk.fusion.TemporaryBRepManager.get().createCylinderOrCone(
+        _pt(p0), radius_cm, _pt(p1), radius_cm)
+    if tmp is None:
+        raise ac_fit.FitError('Fusion would not build a cylinder from those ends '
+                              '- check the length and diameter are not zero')
+    return _add_body(comp, tmp, name)
 
 
 def resolve(inputs):
@@ -650,8 +654,106 @@ def dev_make(app, job):
             'p0_mm': [v * CM for v in p0], 'p1_mm': [v * CM for v in p1]}
 
 
+def dev_selftest(app, job):
+    """End to end inside a live Fusion, against answers known in advance.
+
+    A box and a sphere are built as scratch bodies in the active document and
+    deleted again. The box gives a planar face, whose fitted plane must come back
+    exact and whose centroid must be the face centre; the sphere gives a curved
+    one, which must come back with a large rms - that is the path that warns you
+    the normal is not trustworthy, and it is worth proving it fires.
+    """
+    des = adsk.fusion.Design.cast(app.activeProduct)
+    comp = des.rootComponent
+    tbm = adsk.fusion.TemporaryBRepManager.get()
+    results = []
+    made = []
+
+    def note(name, ok, detail=''):
+        results.append({'check': name, 'ok': bool(ok), 'detail': str(detail)})
+
+    try:
+        # ---- a 4 x 6 x 10 cm box, axis-aligned ---------------------------- #
+        centre = adsk.core.Point3D.create(0.0, 0.0, 0.0)
+        obb = adsk.core.OrientedBoundingBox3D.create(
+            centre, adsk.core.Vector3D.create(1.0, 0.0, 0.0),
+            adsk.core.Vector3D.create(0.0, 1.0, 0.0), 4.0, 6.0, 10.0)
+        box = _add_body(comp, tbm.createBox(obb), 'ac_selftest_box')
+        made.append(box)
+
+        top = None
+        for f in box.faces:
+            pl = adsk.core.Plane.cast(f.geometry)
+            if pl and abs(pl.normal.z) > 0.999:
+                if top is None or f.centroid.z > top.centroid.z:
+                    top = f
+        note('the box has a planar top face', top is not None)
+
+        if top is not None:
+            fit = fitted_plane([top])
+            note('a planar face fits exactly',
+                 fit['rms'] * CM < 1e-6 and fit['max_dev'] * CM < 1e-6,
+                 'rms %.3e mm, worst %.3e mm' % (fit['rms'] * CM,
+                                                 fit['max_dev'] * CM))
+            note('and its normal is the face normal',
+                 abs(abs(fit['normal'][2]) - 1.0) < 1e-9, fit['normal'])
+
+            org, what = origin_from_entity(top, True)
+            note('a planar face gives its centre',
+                 abs(org[0]) < 1e-6 and abs(org[1]) < 1e-6
+                 and abs(org[2] - 5.0) < 1e-6,
+                 '%s at %.4f %.4f %.4f cm' % (what, org[0], org[1], org[2]))
+
+            d, what = direction_from_entity(top)
+            note('a planar face also reads as a direction',
+                 abs(abs(d[2]) - 1.0) < 1e-9, what)
+
+            # ---- the cylinder, against pi r^2 L ------------------------- #
+            dia_mm, len_mm = 4.0, 20.0
+            p0, p1 = cylinder_ends(org, fit['normal'], len_mm * MM, False, False)
+            cyl = build_cylinder(comp, p0, p1, 0.5 * dia_mm * MM, 'ac_selftest_cyl')
+            made.append(cyl)
+            want = math.pi * (0.5 * dia_mm) ** 2 * len_mm
+            got = cyl.volume * 1000.0
+            note('the cylinder volume is pi r^2 L',
+                 abs(got - want) / want < 1e-4,
+                 '%.4f vs %.4f mm3' % (got, want))
+            note('and it is a solid', cyl.isSolid)
+            bb = cyl.boundingBox
+            note('it starts at the origin and runs one length',
+                 abs((bb.maxPoint.z - bb.minPoint.z) * CM - len_mm) < 1e-6,
+                 '%.4f mm tall' % ((bb.maxPoint.z - bb.minPoint.z) * CM))
+            note('and it sits on the face, not through it',
+                 abs(bb.minPoint.z * CM - org[2] * CM) < 1e-6,
+                 'base at %.4f mm' % (bb.minPoint.z * CM))
+
+        # ---- a curved face must report a large rms, not a quiet one ------- #
+        sph = _add_body(
+            comp, tbm.createSphere(adsk.core.Point3D.create(30.0, 0.0, 0.0), 2.0),
+            'ac_selftest_sphere')
+        made.append(sph)
+        if sph.faces.count:
+            fit = fitted_plane([sph.faces.item(0)])
+            note('a curved face reports a large deviation rather than a quiet one',
+                 fit['max_dev'] * CM > 1.0,
+                 'worst %.3f mm over %d points' % (fit['max_dev'] * CM,
+                                                   fit['points']))
+    finally:
+        if not job.get('keep'):
+            for b in made:
+                try:
+                    b.deleteMe()
+                except Exception:
+                    pass
+
+    return {'passed': sum(1 for r in results if r['ok']),
+            'failed': sum(1 for r in results if not r['ok']),
+            'checks': results}
+
+
 DEV_COMMANDS = {
     'ping': dev_ping,
     'fit': dev_fit,
     'make': dev_make,
+    'selftest': dev_selftest,
 }
