@@ -128,14 +128,39 @@ def selected(sel_input):
     return [sel_input.selection(i).entity for i in range(sel_input.selectionCount)]
 
 
-def face_samples(face):
-    """Display-mesh vertices of one face, with lumped-area weights.
+def face_mesh(face):
+    """A triangle mesh for one face, whether or not Fusion has drawn it yet.
 
     The display mesh is what both Fit Primitives and Mesh to Part fit through, and
     for the same reason: it exists for every face, analytic or not, and it is the
-    only representation a lofted or imported surface shares with a plane.
+    only representation a lofted or imported surface shares with a plane. But it
+    only exists once the face has been DISPLAYED - on a body built a moment ago
+    inside a BaseFeature, bestMesh raises "InternalValidationError : count > 0".
+
+    So fall back to calculating one. The tolerances are deliberately loose and
+    tied to the face's own size: TriangleMeshCalculator with a tight tolerance and
+    no side-length or aspect limit has taken this Fusion down before, and a plane
+    fit does not need a fine mesh - it needs points spread over the face.
     """
-    tm = face.meshManager.displayMeshes.bestMesh
+    mm = face.meshManager
+    try:
+        meshes = mm.displayMeshes
+        if meshes.count > 0:
+            return meshes.bestMesh
+    except Exception:
+        pass
+    bb = face.boundingBox
+    diag = bb.minPoint.distanceTo(bb.maxPoint) or 1.0
+    calc = mm.createMeshCalculator()
+    calc.surfaceTolerance = max(diag / 500.0, 1.0e-4)
+    calc.maxSideLength = diag / 8.0
+    calc.maxAspectRatio = 10.0
+    return calc.calculate()
+
+
+def face_samples(face):
+    """Vertices of a face's triangle mesh, with lumped-area weights."""
+    tm = face_mesh(face)
     coords = tm.nodeCoordinatesAsDouble
     idx = list(tm.nodeIndices)
     pts = [(coords[3 * i], coords[3 * i + 1], coords[3 * i + 2])
