@@ -1,4 +1,4 @@
-"""The plane fit, and nothing else.
+"""The plane fit and the cylinder fit, and nothing else.
 
 NO adsk IMPORTS, NO numpy - pure stdlib, so the geometry can be proved right with
 `py -3.10 tests/test_fit.py` and no CAD in the loop. That matters here for the
@@ -12,12 +12,20 @@ FITTED TO VERTICES, NOT TRIANGLE CENTROIDS
     weighted by a third of the area of each adjacent triangle, the standard lumped
     -area approximation to a surface integral - so a face tessellated finely in one
     corner does not drag the plane towards that corner.
+
+THE CYLINDER FIT IS FIT PRIMITIVES' fp_fit.fit_cylinder, UNCHANGED
+    Seeded from the smallest eigenvector of the UNCENTRED normal moment
+    sum(w n n^T) - every normal of a cylinder is perpendicular to its axis - then
+    refined by Levenberg-Marquardt on the geometric residual (distance to axis - r).
+    fp_fit's docstring has the conditioning argument for the uncentred moment; the
+    short version is that the centred one returns a random axis on a narrow strip.
 """
 
 
 import math
 
-__all__ = ['fit_plane', 'jacobi_eigen', 'vertex_weights', 'FitError',
+__all__ = ['fit_plane', 'fit_cylinder', 'cylinder_residuals', 'jacobi_eigen',
+           'vertex_weights', 'vertex_normals', 'FitError',
            'unit', 'cross', 'dot', 'sub', 'add', 'scale', 'length', 'perp_frame']
 
 
@@ -159,6 +167,26 @@ def vertex_weights(vertices, triangles):
     return [x if x > floor else floor for x in w]
 
 
+def vertex_normals(vertices, triangles):
+    """Area-weighted unit normal per vertex; (0, 0, 0) where there is no area.
+
+    The cylinder seed only needs each normal's line, not its sign, so a mesh
+    whose winding flips between faces does no harm as long as it is consistent
+    within one - which is what a per-face tessellation gives.
+    """
+    acc = [(0.0, 0.0, 0.0)] * len(vertices)
+    for i, j, k in triangles:
+        n = cross(sub(vertices[j], vertices[i]), sub(vertices[k], vertices[i]))
+        acc[i] = add(acc[i], n)
+        acc[j] = add(acc[j], n)
+        acc[k] = add(acc[k], n)
+    out = []
+    for n in acc:
+        ln = length(n)
+        out.append(scale(n, 1.0 / ln) if ln > 1e-300 else (0.0, 0.0, 0.0))
+    return out
+
+
 # --------------------------------------------------------------------------- #
 # plane
 # --------------------------------------------------------------------------- #
@@ -201,3 +229,214 @@ def fit_plane(points, weights=None, hint_normal=None):
         'rms': rms, 'max_dev': max(abs(d) for d in devs),
         'signed_min': min(devs), 'signed_max': max(devs), 'points': n,
     }
+
+
+# --------------------------------------------------------------------------- #
+# cylinder
+# --------------------------------------------------------------------------- #
+
+def fit_circle_2d(pts):
+    """Algebraic (Kasa) circle fit - the seed for the real one. Returns (cx, cy, r)."""
+    n = len(pts)
+    if n < 3:
+        raise FitError('a circle needs at least 3 points')
+    mx = sum(p[0] for p in pts) / n
+    my = sum(p[1] for p in pts) / n
+    suu = suv = svv = suuu = svvv = suvv = svuu = 0.0
+    for px, py in pts:
+        u, v = px - mx, py - my
+        suu += u * u
+        suv += u * v
+        svv += v * v
+        suuu += u * u * u
+        svvv += v * v * v
+        suvv += u * v * v
+        svuu += v * u * u
+    det = suu * svv - suv * suv
+    if abs(det) < 1e-300:
+        raise FitError('the painted points are collinear - no circle is defined')
+    b1 = 0.5 * (suuu + suvv)
+    b2 = 0.5 * (svvv + svuu)
+    uc = (b1 * svv - b2 * suv) / det
+    vc = (b2 * suu - b1 * suv) / det
+    r = math.sqrt(max(0.0, uc * uc + vc * vc + (suu + svv) / n))
+    return (uc + mx, vc + my, r)
+
+
+def _solve(a, b):
+    """Gaussian elimination with partial pivoting. a is n x n (mutated), b length n."""
+    n = len(b)
+    m = [list(row) + [b[i]] for i, row in enumerate(a)]
+    for col in range(n):
+        piv = max(range(col, n), key=lambda r: abs(m[r][col]))
+        if abs(m[piv][col]) < 1e-300:
+            return None
+        m[col], m[piv] = m[piv], m[col]
+        inv = 1.0 / m[col][col]
+        for r in range(col + 1, n):
+            f = m[r][col] * inv
+            if f:
+                for c in range(col, n + 1):
+                    m[r][c] -= f * m[col][c]
+    x = [0.0] * n
+    for r in range(n - 1, -1, -1):
+        s = m[r][n] - sum(m[r][c] * x[c] for c in range(r + 1, n))
+        x[r] = s / m[r][r]
+    return x
+
+
+def _cyl_residuals(points, weights, c, d, r):
+    """Weighted RMS and max of (distance from axis - r)."""
+    worst = 0.0
+    acc = 0.0
+    tw = 0.0
+    for p, w in zip(points, weights):
+        v = sub(p, c)
+        t = dot(v, d)
+        rho = length(sub(v, scale(d, t)))
+        e = rho - r
+        acc += w * e * e
+        tw += w
+        if abs(e) > worst:
+            worst = abs(e)
+    return math.sqrt(acc / tw), worst
+
+
+def fit_cylinder(points, normals=None, weights=None, max_iter=80, tol=1e-12):
+    """Geometric least-squares cylinder: minimises sum w*(dist_to_axis - r)^2.
+
+    Seeded from the normals (see the module docstring), then refined by
+    Levenberg-Marquardt over five parameters - two for the axis direction, two for
+    the axis position across it, one for the radius. Position along the axis is not
+    a parameter; it is not observable and leaving it in makes the system singular.
+
+    `normals` may be omitted, in which case the seed falls back to the longest
+    principal direction of the points. That is a much weaker seed and only works on
+    a patch that is long compared with its radius.
+    """
+    n = len(points)
+    if n < 5:
+        raise FitError('a cylinder needs at least 5 points, got %d' % n)
+    w = list(weights) if weights else [1.0] * n
+
+    if normals:
+        # M d = 0 exactly for a cylinder: every normal is perpendicular to the axis.
+        _, vecs = jacobi_eigen(_moment(normals, w))
+        d = unit(vecs[0])
+    else:
+        centre = _centroid(points, w)
+        _, vecs = jacobi_eigen(_moment(points, w, centre))
+        d = unit(vecs[2])
+
+    centre = _centroid(points, w)
+    e1, e2 = perp_frame(d)
+    cx, cy, r = fit_circle_2d([(dot(sub(p, centre), e1), dot(sub(p, centre), e2))
+                               for p in points])
+    c = add(centre, add(scale(e1, cx), scale(e2, cy)))
+    if not (r > 0.0) or not (r < float('inf')):
+        raise FitError('the seed radius is not finite - is the patch flat?')
+
+    lam = 1e-6
+    rms, _ = _cyl_residuals(points, w, c, d, r)
+    for _ in range(max_iter):
+        e1, e2 = perp_frame(d)
+        jtj = [[0.0] * 5 for _ in range(5)]
+        jtf = [0.0] * 5
+        for p, wi in zip(points, w):
+            v = sub(p, c)
+            t = dot(v, d)
+            perp = sub(v, scale(d, t))
+            rho = length(perp)
+            if rho < 1e-300:
+                continue
+            nr = scale(perp, 1.0 / rho)          # unit radial, perpendicular to d
+            f = rho - r
+            # d(rho)/d(axis rotation) = -t * (nr . e_i)  because nr . d == 0
+            j = (-dot(nr, e1), -dot(nr, e2),
+                 -t * dot(nr, e1), -t * dot(nr, e2),
+                 -1.0)
+            for a_ in range(5):
+                jtf[a_] += wi * j[a_] * f
+                for b_ in range(a_, 5):
+                    jtj[a_][b_] += wi * j[a_] * j[b_]
+        for a_ in range(5):
+            for b_ in range(a_):
+                jtj[a_][b_] = jtj[b_][a_]
+
+        improved = False
+        for _try in range(12):
+            damped = [list(row) for row in jtj]
+            for k in range(5):
+                damped[k][k] *= (1.0 + lam)
+                damped[k][k] += lam * 1e-12
+            step = _solve(damped, [-x for x in jtf])
+            if step is None:
+                lam *= 10.0
+                continue
+            c_try = add(c, add(scale(e1, step[0]), scale(e2, step[1])))
+            try:
+                d_try = unit(add(d, add(scale(e1, step[2]), scale(e2, step[3]))))
+            except FitError:
+                lam *= 10.0
+                continue
+            r_try = r + step[4]
+            if r_try <= 0.0:
+                lam *= 10.0
+                continue
+            rms_try, _ = _cyl_residuals(points, w, c_try, d_try, r_try)
+            if rms_try <= rms:
+                delta = rms - rms_try
+                c, d, r, rms = c_try, d_try, r_try, rms_try
+                lam = max(lam * 0.3, 1e-12)
+                improved = delta > tol * max(1.0, rms)
+                break
+            lam *= 10.0
+        if not improved:
+            break
+
+    # Canonical output: axis point closest to the patch, and the extent along it.
+    centre = _centroid(points, w)
+    ts = [dot(sub(p, c), d) for p in points]
+    c = add(c, scale(d, dot(sub(centre, c), d)))
+    ts = [dot(sub(p, c), d) for p in points]
+    rms, worst = _cyl_residuals(points, w, c, d, r)
+    return {
+        'kind': 'cylinder',
+        'axis_point': c, 'axis': d, 'radius': r,
+        't_min': min(ts), 't_max': max(ts), 'length': max(ts) - min(ts),
+        'start': add(c, scale(d, min(ts))), 'end': add(c, scale(d, max(ts))),
+        'rms': rms, 'max_dev': worst, 'points': n,
+        'sweep_deg': _sweep_degrees(points, c, d, r),
+    }
+
+
+def cylinder_residuals(points, weights, axis_point, axis, radius):
+    """How far the points sit from a cylinder you name, rather than the fitted one.
+
+    Used to answer "if I round this bore to 12.00 mm, how much does the real surface
+    depart from it" - the question that actually matters when a fitted number is
+    about to be replaced by a nominal one.
+    """
+    w = list(weights) if weights else [1.0] * len(points)
+    return _cyl_residuals(points, w, axis_point, unit(axis), radius)
+
+
+def _sweep_degrees(points, c, d, r):
+    """How much of the circumference the patch actually covers.
+
+    A fit over a 20 degree sliver is numerically fine and physically meaningless -
+    the radius is then almost unconstrained. The caller warns on this rather than
+    pretending the number is trustworthy.
+    """
+    e1, e2 = perp_frame(d)
+    angs = []
+    for p in points:
+        v = sub(p, c)
+        a = math.atan2(dot(v, e2), dot(v, e1))
+        angs.append(a)
+    angs.sort()
+    if len(angs) < 2:
+        return 0.0
+    gaps = [angs[i + 1] - angs[i] for i in range(len(angs) - 1)]
+    gaps.append(angs[0] + 2.0 * math.pi - angs[-1])
+    return math.degrees(2.0 * math.pi - max(gaps))

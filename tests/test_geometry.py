@@ -98,6 +98,77 @@ check('the two diagonal corners carry twice the weight of the others',
       w)
 
 # --------------------------------------------------------------------------- #
+print('the cylinder fit, through a mesh as ac_core feeds it')
+# --------------------------------------------------------------------------- #
+
+
+def tube_mesh(c, d, r, n_ang, n_len, length, sweep_deg=360.0):
+    """A tessellated cylinder (or strip of one): vertices ON the surface, and
+    triangles wound consistently, like one face's display mesh."""
+    e1, e2 = ac_fit.perp_frame(d)
+    full = sweep_deg >= 360.0
+    na = n_ang if full else n_ang + 1
+    verts = []
+    for j in range(n_len + 1):
+        t = length * j / n_len
+        for i in range(na):
+            a = math.radians(sweep_deg) * i / n_ang
+            verts.append(ac_fit.add(c, ac_fit.add(
+                ac_fit.scale(d, t),
+                ac_fit.add(ac_fit.scale(e1, r * math.cos(a)),
+                           ac_fit.scale(e2, r * math.sin(a))))))
+    tris = []
+    for j in range(n_len):
+        for i in range(n_ang):
+            a0, a1 = j * na + i, j * na + (i + 1) % na
+            b0, b1 = a0 + na, a1 + na
+            tris.append((a0, a1, b1))
+            tris.append((a0, b1, b0))
+    return verts, tris
+
+
+TC = (2.0, -1.0, 0.5)
+TD = ac_fit.unit((0.3, -0.4, 1.0))
+TR = 0.6
+verts, tris = tube_mesh(TC, TD, TR, n_ang=36, n_len=8, length=3.0)
+nrm = ac_fit.vertex_normals(verts, tris)
+check('vertex normals of a tube are perpendicular to its axis',
+      max(abs(ac_fit.dot(n, TD)) for n in nrm) < 1e-12)
+
+def radial(p):
+    v = ac_fit.sub(p, TC)
+    return ac_fit.unit(ac_fit.sub(v, ac_fit.scale(TD, ac_fit.dot(v, TD))))
+
+
+# rim vertices see a lopsided triangle fan, so their normal leans a little round
+# the circumference (0.9996 here) - still perpendicular to the axis, which is all
+# the seed uses
+dots = [ac_fit.dot(n, radial(p)) for p, n in zip(verts, nrm)]
+check('and radial to within the rim lean, all with the same sign',
+      min(dots) > 0.999 or max(dots) < -0.999, (min(dots), max(dots)))
+fit = ac_fit.fit_cylinder(verts, normals=nrm,
+                          weights=ac_fit.vertex_weights(verts, tris))
+check('a tessellated tube gives back its axis',
+      close(abs(ac_fit.dot(fit['axis'], TD)), 1.0, 1e-12),
+      ac_fit.dot(fit['axis'], TD))
+check('its radius', close(fit['radius'], TR, 1e-9), fit['radius'])
+check('and its length, rim to rim', close(fit['length'], 3.0, 1e-9),
+      fit['length'])
+mid = C._midpoint(fit['start'], fit['end'])
+check('the axis midpoint is the middle of the tube',
+      vclose(mid, ac_fit.add(TC, ac_fit.scale(TD, 1.5)), 1e-9), mid)
+
+verts, tris = tube_mesh(TC, TD, TR, n_ang=10, n_len=20, length=3.0,
+                        sweep_deg=40.0)
+fit = ac_fit.fit_cylinder(verts, normals=ac_fit.vertex_normals(verts, tris),
+                          weights=ac_fit.vertex_weights(verts, tris))
+check('a 40 degree strip still gives its radius', close(fit['radius'], TR, 1e-8),
+      fit['radius'])
+check('and reports 40 degrees of arc, which the dialog warns on',
+      close(fit['sweep_deg'], 40.0, 1e-6) and fit['sweep_deg'] < 45.0,
+      fit['sweep_deg'])
+
+# --------------------------------------------------------------------------- #
 print('cylinder placement')
 # --------------------------------------------------------------------------- #
 
@@ -146,8 +217,11 @@ check('the body name carries the size in millimetres',
       == 'Cylinder 4.00 x 20.00 mm',
       C.body_name({'diameter_mm': 4.0, 'length_mm': 20.0}))
 
-check('both direction modes are declared',
-      [k for k, _l in C.DIRECTION_MODES] == ['fit', 'entity'])
+check('the direction modes are declared, old indices unchanged',
+      [k for k, _l in C.DIRECTION_MODES] == ['fit', 'entity', 'cylface', 'cylfit'])
+check('every mode has its own direction selection',
+      sorted(C.DIRECTION_INPUT) == sorted(k for k, _l in C.DIRECTION_MODES)
+      and len(set(C.DIRECTION_INPUT.values())) == len(C.DIRECTION_INPUT))
 
 print()
 if FAILED:

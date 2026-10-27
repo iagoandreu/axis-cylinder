@@ -1,11 +1,11 @@
 """Run the add-in's self-test inside a live Fusion and print what it found.
 
-    py -3.10 tools/livetest.py          # scratch bodies are deleted afterwards
-    py -3.10 tools/livetest.py keep     # leave them, to look at
+    py -3.10 tools/livetest.py          # in a new document, closed unsaved afterwards
+    py -3.10 tools/livetest.py keep     # leave that document open, to look at
 
 Needs the dev bridge on: a file called devbridge.on next to the installed add-in,
-then Stop and Run it once. Everything it builds goes in the ACTIVE document, so
-open a scratch one if you care about what is there.
+then Stop and Run it once. It opens a NEW document, runs there and closes it
+unsaved (keep leaves it open); the active document is never touched.
 """
 
 import sys
