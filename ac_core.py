@@ -681,6 +681,8 @@ def on_created(app, cmd):
     inputs.addBoolValueInput('onSurface', 'Put a surface origin on the surface',
                              True, '', bool(s['onSurface']))
 
+    # off at every opening: the preview builds the real cylinder on every change
+    inputs.addBoolValueInput('preview', 'Preview', True, '', False)
     info = inputs.addTextBoxCommandInput('info', '', '', 10, True)
     info.isFullWidth = True
     refresh(inputs)
@@ -839,6 +841,9 @@ def target_component(app, entity):
 def on_preview(app, inputs, args):
     """The real thing, built and left for Fusion to throw away. isValidResult stays
     False so execute builds it again properly rather than adopting the preview."""
+    pv = inputs.itemById('preview')
+    if pv is not None and not pv.value:
+        return
     try:
         r = resolve(inputs)
     except Exception:
